@@ -8,17 +8,23 @@ const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 
 // ---- tunables (priors; everything data-dependent is fitted at runtime) ----
-const K_DISTINCT = 6;        // distinct reads used in a fit
-const RECENCY = 0.7;         // per-read weight decay (newest = 1)
-const N_DAMP = 0.55;         // damping of players-growth slope (launch growth decelerates)
-const E_DAMP = 0.7;          // damping of earners-growth slope
-const SLOPE_TAU = 0.3;       // prior sd of a trophy's earners slope around the cross-trophy centre
-const N_SLOPE_MAX = 1.5;
-const NEVER_REFRESHED_SHIFT = -1.45; // logit shift when history is one unchanged page
+const K_DISTINCT = 40;       // distinct reads kept for a fit
+const WIN_H = 36;            // fit window (hours before the last distinct read)
+const REC_H = 18;            // recency e-folding (hours) of fit weights
+const TAU_N0 = 24;           // prior e-folding (h) of players-growth deceleration; refined from the data when the window shows it
+const TAU_E = 72;            // e-folding (h) of earners-growth decay (progression persists; saturation does the capping)
+const A_PRIOR_SD = 0.04;     // sd (per hour) of a trophy's earners log-growth around the cross-trophy level curve
+const PLAT_A_CAP = 0.03;     // platinum's earners grow very slowly
+const L_CAP = 0.847;         // logit of the soft ceiling for rising rates (70%)
+const REL_SD = 0.3;         // relative uncertainty of the predicted move (logit)
+const N_SD = 0.3;            // extra relative uncertainty of players growth
+const NEVER_REFRESHED_SHIFT = -1.45; // logit shift at ~90 min when history is one unchanged page
 const NEVER_REFRESHED_SIGMA = 0.65;
-const BASE_SIGMA = 0.2;      // model-uncertainty floor (logit)
-const N_SLOPE_SD = 0.32;     // uncertainty of players slope (per unit log-time)
-const PLAT_SLOPE_CAP = 0.25; // platinum's earners grow very slowly
+const NR_H0 = 2;           // hours (last read to target) at which the never-refreshed values apply (the practice horizon)
+const NR_SHIFT_K = 0.6;      // extra downward shift per e-fold of horizon
+const NR_SIGMA_K = 0.25;     // extra spread per e-fold of horizon
+const BASE_SIGMA = 0.3;      // model-uncertainty floor (logit)
+const HZ_SD = 0.15;          // spread that grows with the horizon: HZ_SD^2 * days
 
 interface Read { at: string; players_tracked: number; rates: Array<number | null>; }
 interface Case {
@@ -75,69 +81,99 @@ function forecast(c: Case): Array<{ id: number; q: number[] }> {
     c.trophies.map((t, i) => {
       const r0 = last.rates[i] ?? 0;
       const { shift, sigma } = extra(i);
-      return { id: t.id, r0, shift, sigma };
+      return { id: t.id, r0, shift, sigma, cap: false };
     });
 
-  type Spec = { id: number; r0: number; shift: number; sigma: number; hi?: boolean };
+  type Spec = { id: number; r0: number; shift: number; sigma: number; raw: number; cap: boolean };
   let specs: Spec[];
 
   if (D.length < 2) {
-    // Never-refreshed page: the next refresh will show many more players; rates fall sharply.
-    specs = persist(() => ({ shift: NEVER_REFRESHED_SHIFT, sigma: NEVER_REFRESHED_SIGMA }));
+    // Never-refreshed page: the next refresh will show many more players; rates fall sharply (more so the longer the horizon).
+    const hz = Math.max(0, hours(c.target, 0) - hours(last.at, 0));
+    const lg = Math.log(Math.max(1, hz / NR_H0));
+    specs = persist(() => ({ shift: NEVER_REFRESHED_SHIFT - NR_SHIFT_K * lg, sigma: NEVER_REFRESHED_SIGMA + NR_SIGMA_K * lg }));
   } else {
-    const dx = D.slice(0, -1).map((r) => xOf(r.at) - xL);
-    const w = D.slice(0, -1).map((_, k, a) => RECENCY ** (a.length - 1 - k));
-    // players growth
-    const lnN = (r: Read): number => Math.log(r.players_tracked);
-    const dyN = D.slice(0, -1).map((r) => lnN(r) - lnN(L));
-    const nFit = anchoredSlope(dx, dyN, w, dx.map(() => 0.02));
-    const sN = Math.min(N_SLOPE_MAX, Math.max(0, nFit.s)) * N_DAMP;
-    const lnNgrowth = sN * u;
+    // ---- dynamics branch: per-trophy log-earners growth (per hour, slowly decaying) vs players growth (decelerating) ----
+    const tL = hours(L.at, 0);
+    const uH = Math.max(0, hours(c.target, 0) - tL);          // extrapolation in hours
+    const win = D.filter((r) => tL - hours(r.at, 0) <= WIN_H);
+    const W = win.length >= 2 ? win : D.slice(-2);
+    const tt = W.map((r) => hours(r.at, 0) - tL);              // <= 0
+    const wt = tt.map((t) => Math.exp(t / REC_H));
+
+    // players growth: slope per hour, deceleration from the slope's own trend when the window shows it
+    const lnN = W.map((r) => Math.log(Math.max(1, r.players_tracked)));
+    const wls = (xs: number[], ys: number[], ws: number[]) => {
+      let sw = 0, sx = 0, sy = 0;
+      for (let k = 0; k < xs.length; k++) { sw += ws[k]; sx += ws[k] * xs[k]; sy += ws[k] * ys[k]; }
+      const mx = sx / sw, my = sy / sw;
+      let sxx = 0, sxy = 0;
+      for (let k = 0; k < xs.length; k++) { sxx += ws[k] * (xs[k] - mx) ** 2; sxy += ws[k] * (xs[k] - mx) * (ys[k] - my); }
+      return { slope: sxx > 1e-9 ? sxy / sxx : 0, mx, my, sxx, sw };
+    };
+    const nf = wls(tt, lnN, tt.map(() => 1));
+    const bAvg = Math.max(0, nf.slope);
+    const cOff = -nf.mx;                                       // hours between window centre and anchor
+    let tauN = TAU_N0;
+    if (W.length >= 3) {
+      const ks: number[] = [], ms: number[] = [], wsd: number[] = [];
+      for (let k = 1; k < W.length; k++) {
+        const dt = tt[k] - tt[k - 1]; const g = (lnN[k] - lnN[k - 1]) / dt;
+        if (dt > 0.5 && g > 1e-4) { ks.push(Math.log(g)); ms.push((tt[k] + tt[k - 1]) / 2); wsd.push(dt); }
+      }
+      if (ks.length >= 2) {
+        const f = wls(ms, ks, wsd);
+        const span = ms[ms.length - 1] - ms[0];
+        const invFit = Math.min(1 / 10, Math.max(1 / 150, -f.slope));
+        const wFit = Math.min(1, span / 24);
+        tauN = 1 / (wFit * invFit + (1 - wFit) / TAU_N0);
+      }
+    }
+    const bL = bAvg * Math.exp(-cOff / tauN);
+    const growN = bL * tauN * (1 - Math.exp(-uH / tauN));
 
     // earners growth per trophy
-    const raw: Array<{ s: number; se: number; ok: boolean }> = [];
-    for (let i = 0; i < nT; i++) {
-      const rL = L.rates[i];
-      if (rL == null || rL <= 0) { raw.push({ s: 0, se: 1, ok: false }); continue; }
-      const eL = (rL * L.players_tracked) / 100;
-      const pts: number[] = [], ys: number[] = [], ws: number[] = [], es: number[] = [];
-      for (let k = 0; k < D.length - 1; k++) {
-        const r = D[k].rates[i];
-        if (r == null || r <= 0) continue;
-        const e = (r * D[k].players_tracked) / 100;
-        pts.push(dx[k]); ys.push(Math.log(e / eL)); ws.push(w[k]);
-        const rel = Math.hypot(Math.min(1, 0.005 / r + 1 / Math.sqrt(Math.max(e, 1))), Math.min(1, 0.005 / rL + 1 / Math.sqrt(Math.max(eL, 1))));
-        es.push(rel);
+    const fits = c.trophies.map((_, i) => {
+      const xs: number[] = [], ys: number[] = [], ws: number[] = [];
+      for (let k = 0; k < W.length; k++) {
+        const r = W[k].rates[i];
+        if (r == null || r <= 0 || r >= 99.99) continue;
+        const e = (r * W[k].players_tracked) / 100;
+        const s2 = (0.005 / r) ** 2 + 1 / Math.max(e, 1);
+        xs.push(tt[k]); ys.push(Math.log(e)); ws.push(wt[k] / s2);
       }
-      if (pts.length === 0) { raw.push({ s: 0, se: 1, ok: false }); continue; }
-      const f = anchoredSlope(pts, ys, ws, es);
-      raw.push({ s: f.s, se: f.se, ok: true });
-    }
-    const centre = wmedian(raw.filter((r) => r.ok && r.se < 0.5).map((r) => r.s));
-    const centreUse = raw.some((r) => r.ok && r.se < 0.5) ? centre : sN;
-    const staleF = Math.min(1, staleHours / 12);
+      if (xs.length < 2) return null;
+      const f = wls(xs, ys, ws);
+      if (f.sxx < 1e-6) return null;
+      return { a: f.slope, se: Math.sqrt(1 / f.sxx), lnE: ys[ys.length - 1] };
+    });
+    // cross-trophy prior: kernel regression of slope on earners level
+    const good = fits.map((f, i) => ({ f, i })).filter((o) => o.f && o.f.se < 0.5);
+    const prior = (lvl: number): number => {
+      let sw = 0, sa = 0;
+      for (const o of good) { const w = Math.exp(-0.5 * ((o.f!.lnE - lvl) / 1.0) ** 2) / (o.f!.se ** 2 + 0.02 ** 2); sw += w; sa += w * o.f!.a; }
+      return sw > 0 ? sa / sw : bL;
+    };
+    const aDecay = (cOff2: number) => Math.exp(-cOff2 / TAU_E);
 
     specs = c.trophies.map((t, i) => {
       const r0 = L.rates[i] ?? last.rates[i] ?? 0;
-      const rr = raw[i];
-      let s: number, postVar: number;
-      if (!rr.ok) { s = centreUse; postVar = SLOPE_TAU ** 2; }
+      const f = fits[i];
+      const lvl = r0 > 0 ? Math.log((r0 * L.players_tracked) / 100) : 0;
+      const pr = prior(lvl);
+      let a: number, sa: number;
+      if (!f) { a = pr; sa = A_PRIOR_SD; }
       else {
-        const wt = SLOPE_TAU ** 2 / (SLOPE_TAU ** 2 + rr.se ** 2);
-        s = wt * rr.s + (1 - wt) * centreUse;
-        postVar = wt * rr.se ** 2;
+        const wFit = A_PRIOR_SD ** 2 / (A_PRIOR_SD ** 2 + f.se ** 2);
+        a = wFit * f.a + (1 - wFit) * pr; sa = Math.sqrt(wFit) * f.se;
+        sa = Math.hypot(sa, (1 - wFit) * A_PRIOR_SD);
       }
-      s = Math.max(0, s) * E_DAMP;
-      if (t.tier === 'platinum') s = Math.min(s, PLAT_SLOPE_CAP);
-      s = Math.min(s, sN + 0.05); // earners cannot outgrow players for long
-      const noRate = !(r0 > 0);
-      const shiftLn = (s * u - lnNgrowth); // ln(E ratio) - ln(N ratio)
-      // convert to logit shift: for small rates logit shift == ln rate shift
-      const thin = D.length <= 2 ? 1 : 0; // a two-read fit (one of them stale) is weak evidence: lean toward more dilution
-      let shift = shiftLn - 0.25 * staleF - 0.12 * thin * Math.min(1, u);
-      let sigma2 = BASE_SIGMA ** 2 + (N_SLOPE_SD * u) ** 2 + (u ** 2) * postVar + (0.3 * staleF) ** 2;
-      if (noRate) { sigma2 += 0.5 ** 2; }
-      return { id: t.id, r0, shift, sigma: Math.sqrt(sigma2) };
+      a = Math.max(0, a) * aDecay(cOff);
+      if (t.tier === 'platinum') a = Math.min(a, PLAT_A_CAP);
+      const growE = a * TAU_E * (1 - Math.exp(-uH / TAU_E));
+      const raw = growE - growN;
+      const sig2 = BASE_SIGMA ** 2 + HZ_SD ** 2 * (uH / 24) + (REL_SD * (growE + growN)) ** 2 + (sa * uH) ** 2 + (N_SD * growN) ** 2;
+      return { id: t.id, r0, shift: raw, sigma: Math.sqrt(sig2), cap: true };
     });
   }
 
@@ -154,12 +190,14 @@ function forecast(c: Case): Array<{ id: number; q: number[] }> {
       q = Z.map((z) => expit(base + z * Math.max(sp.sigma, 0.9)));
     } else {
       const l0 = logit(r0);
-      // rounding of the printed target rate adds noise, esp. near the 0.01 floor
-      const lm = l0 + sp.shift;
-      const rt = expit(lm);
-      const rnd = Math.min(0.8, 0.0029 / Math.max(rt, 0.003));
+      const place = (d: number): number => {
+        if (!sp.cap || d <= 0 || l0 >= L_CAP) return l0 + d;
+        return L_CAP - (L_CAP - l0) * Math.exp(-d / (L_CAP - l0));
+      };
+      const rt = expit(place(sp.shift));
+      const rnd = Math.min(0.8, 0.0029 / Math.max(rt, 0.003)); // rounding of the printed target rate, esp. near the 0.01 floor
       const sig = Math.hypot(sp.sigma, rnd);
-      q = Z.map((z) => expit(lm + z * sig));
+      q = Z.map((z) => expit(place(sp.shift + z * sig)));
     }
     q = q.map((v) => round4(Math.min(100, Math.max(0.01, v))));
     for (let j = 1; j < 5; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
